@@ -1,6 +1,11 @@
 # A Windows binary on demand, for testing a fix without a local toolchain. The release workflow
 # publishes releases; this one only uploads an artifact, and defaults to RelWithDebInfo so the
 # .pdb next to lichii.exe can symbolize a minidump.
+#
+# RelWithDebInfo needs CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded (/Z7) below. MSVC's default
+# /Zi writes every object's debug info into one program database per target, and parallel cl.exe
+# processes then fail with "C1041: cannot open program database"; /Z7 keeps the debug info in the
+# objects, and sccache cannot cache a /Zi compilation anyway. The linker still writes lichii.pdb.
 name: build
 
 on:
@@ -103,6 +108,7 @@ jobs:
         run: >-
           cmake -S . -B build/release -G Ninja
           -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
           -DBUILD_TESTING=OFF
           -DYUZU_TESTS=OFF
           -DYUZU_CMD=OFF
