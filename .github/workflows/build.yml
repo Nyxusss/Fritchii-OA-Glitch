@@ -1,0 +1,173 @@
+# A Windows binary on demand, for testing a fix without a local toolchain. The release workflow
+# publishes releases; this one only uploads an artifact, and defaults to RelWithDebInfo so the
+# .pdb next to lichii.exe can symbolize a minidump.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: CMake build type
+        type: choice
+        default: RelWithDebInfo
+        options:
+          - RelWithDebInfo
+          - Release
+      trace_env:
+        description: 'Debugging variables baked into run-trace.bat, space separated (e.g. "EDEN_NX2_IPC_TRACE=1")'
+        type: string
+        default: EDEN_NX2_IPC_TRACE=1
+  push:
+    branches:
+      - "ccr-*"
+    paths:
+      - "src/**"
+      - "!src/tests/**"
+      - "CMakeLists.txt"
+      - "CMakeModules/**"
+      - "externals/**"
+      - "cpmfile.json"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+# A development build is only interesting for the newest commit on the branch.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows-x86_64 test binary
+    runs-on: windows-2022
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 3G
+      BUILD_TYPE: ${{ inputs.build_type || 'RelWithDebInfo' }}
+      TRACE_ENV: ${{ inputs.trace_env || 'EDEN_NX2_IPC_TRACE=1' }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      # Same as the release workflow: MSVC is not something ccache handles well.
+      - name: Install sccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Restore CPM downloads
+        id: cpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-windows-x86_64-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-windows-x86_64-v2-
+            cpm-${{ runner.os }}-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .sccache
+          key: objects-windows-x86_64-v2-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-windows-x86_64-v2-${{ github.sha }}-
+            objects-windows-x86_64-v2-
+
+      - name: Configure
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=OFF
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DLICHII_BUILD_TAG=test-${{ github.run_number }}
+          -DLICHII_BUILD_PLATFORM=windows-x86_64
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Save CPM downloads
+        if: steps.cpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        shell: bash
+        run: |
+          sccache --zero-stats
+          cmake --build build/release --target yuzu --parallel
+          sccache --show-stats
+
+      - name: Stop sccache
+        if: always() && steps.compiler-cache.outcome == 'success'
+        shell: pwsh
+        run: sccache --stop-server
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: .sccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'build/release/bin/lichii.exe')) {
+            throw 'build/release/bin/lichii.exe was not produced'
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+
+      # The debugging variables are read with getenv, so a launcher next to the binary is all they
+      # need. The log filter is a config setting, not a variable, but its default (*:Info) already
+      # passes the service warnings and the IPC trace.
+      - name: Write run-trace.bat
+        shell: pwsh
+        run: |
+          $lines = @('@echo off', 'rem Launches this build with the debugging variables the fix is being traced with.')
+          foreach ($pair in ($env:TRACE_ENV -split '\s+' | Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' })) {
+            $lines += "set $pair"
+          }
+          $lines += 'start "" "%~dp0lichii.exe" %*'
+          $lines | Set-Content -Encoding ascii build/release/bin/run-trace.bat
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-windows-x86_64-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 7
