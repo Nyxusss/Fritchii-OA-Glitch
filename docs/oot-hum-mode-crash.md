@@ -1,74 +1,100 @@
-# Ocarina of Time: crash when enabling the ocarina's hum mode
+# Ocarina of Time: the ocarina's hum mode panics the game
 
-Program id `0400486024DEC000`. Reported symptom: the game crashes when hum mode
-is selected on the ocarina during gameplay.
+Program id `0400486024DEC000`. Reported symptom: selecting hum mode on the
+ocarina during gameplay stops the game.
 
-**Status: not root-caused.** No `eden_log.txt` was supplied with the report, so
-the faulting frame is unknown. Everything below is what the tree shows; none of
-it is confirmed as the cause, and no fix is written yet.
+## Root cause
 
-## What the report still needs
+The guest aborts; the host does not. The Switch 2 audio entry point
+`aud:u` is served by `INx2AudioUserClient`
+(`src/core/hle/service/audio/nx2_audio_user_client.h`), which implements two
+commands: 1 returns an `IAudioOutManager` and 2 an `IAudioRendererManager`.
+There is no command for the audio **input** manager — the header already
+includes `audio_in_manager.h` without using it.
 
-1. `eden_log.txt` and `eden_log.txt.old` from the session that crashed. The
-   `Booting game:` line and the `Lichii Version: ... | nx2-<sha>` header pin
-   the build.
-2. Whether the log *ends* abruptly or ends with an error. A log that just stops
-   means the host process died: the Windows minidump in
-   `%LOCALAPPDATA%\CrashDumps\lichii.exe.<pid>.dmp` is then the primary
-   evidence (read with the `minidump` package, symbolize against the build's
-   `lichii.pdb`).
-3. A run with `EDEN_NX2_IPC_TRACE=1` and the filter
-   `*:Info Service_Audio:Debug`, to settle whether hum mode opens `audin:u` at
-   all. That decides between the audio-capture hypothesis below and the GPU
-   paths.
+Unknown commands on that interface are auto-stubbed, because
+`ReportUnimplementedFunction` in `src/core/hle/service/service.cpp` stubs every
+service whose name starts with `nx2:` (and every caller process that
+`IsSwitch2()`). The stub replies `ResultSuccess` followed by zeroed words —
+success, but no session handle for the object the caller asked for. The SDK then
+uses that handle, finds nothing behind it, and aborts the title.
 
-Build and package it on the owner's PC with:
+So hum mode asks `aud:u` for the capture manager, is told it succeeded, and gets
+an empty object. The fix is to wire that command to `IAudioInManager`, the way
+commands 1 and 2 are already wired.
+
+### Corroboration
+
+`Frizti/Fritchii` PR #16, "Switch 2 microphone capture on v4.1 (ocarina panic
+C8099)", reports the same thing from the other side: on the official v4.1
+release the ocarina stops the game with `Userspace PANIC C8099` with either a
+webcam or a DualSense microphone, and the patch adds a Switch 2 capture path
+plus silent capture when the host microphone cannot be opened. That PR is open,
+targets `hotfix/v4.1` rather than `nx2`, cherry-picks two commits from a
+repository this branch cannot reach, and its author states that tests were not
+built or run and that playing a song on the ocarina was never confirmed. Treat
+its claims as a second report, not as a verified fix.
+
+### Still missing
+
+The command index. The log names it: the first unknown command on a service is
+reported once with its number and command buffer, as
+
+```
+Unknown / unimplemented function '<N>(<unknown>)': port='nx2:aud:u' cmd_buf={...}
+```
+
+Capture it with `EDEN_NX2_IPC_TRACE=1` and the filter
+`*:Info Service_Audio:Debug`:
 
 ```
 bash C:/lx/build-fix.sh <branch> oot-hum-trace "Ocarina of Time - hum mode trace" \
   "EDEN_NX2_IPC_TRACE=1" "*:Info Service_Audio:Debug"
 ```
 
-## Audio capture path, as it stands
+Wiring a guessed index would send a build out for nothing, so the handler waits
+on that line.
 
-If hum mode listens on a microphone it runs `audin:u` → `IAudioInManager`
-(`src/core/hle/service/audio/audio_in_manager.cpp`) → `AudioIn::System`
-(`src/audio_core/in/audio_in_system.cpp`) → `DeviceSession` →
-`SinkStream::ProcessAudioIn`. That chain is equivalent to upstream; upstream's
-microphone release-buffer fix (Eglantine `84e11a52ba`, eden PR #3336) is
-already present in `src/audio_core/sink/sink_stream.cpp`.
+## Fixed here: the capture sink
 
-Two real defects sit on that path. Both are inherited from upstream (upstream
-`nx2` has the same code today), and neither is proven to crash — they make the
-microphone deliver nothing:
+With the manager in place the microphone still has to open, and two defects on
+that path stopped it. Both were inherited from upstream, which has the same code
+today, and both are corrected in `src/audio_core/sink/cubeb_sink.cpp`:
 
-- `CubebSink::CubebSink` takes `device_channels` from
-  `cubeb_get_max_channel_count`, which reports the *output* device. The same
-  class backs the input sink (`AudioCore::CreateSinks`), so on a 5.1 or 7.1
-  output the capture stream is opened with 6 channels and
-  `CUBEB_LAYOUT_3F2_LFE`. `cubeb_stream_init` rejects that for a mono or
-  stereo microphone, `stream_backend` stays null, and the game reads silence.
-  The SDL3 sink does not have this problem: it pins `device_channels = 2`.
-- The same constructor only enumerates `CUBEB_DEVICE_TYPE_OUTPUT`, so a
-  microphone picked in the UI (`audio_input_device_id`) is looked up among
-  output devices, never found, and `input_device` is left unset.
+- `CubebSink::AcquireSinkStream` passed `device_channels` to capture streams.
+  That value comes from `cubeb_get_max_channel_count`, which reports the
+  *output* device, so on a 5.1 or 7.1 output the microphone was opened with six
+  channels and `CUBEB_LAYOUT_3F2_LFE`. `cubeb_stream_init` rejects that for a
+  mono or stereo microphone, `stream_backend` stayed null, and the game read
+  silence. Input streams now open with two channels, as the SDL3 sink already
+  did.
+- `CubebSink::CubebSink` only enumerated `CUBEB_DEVICE_TYPE_OUTPUT`, so a
+  microphone chosen in the UI (`audio_input_device_id`) was looked up among
+  output devices, never found, and `input_device` was left unset. Both device
+  types are enumerated now, disabled devices are skipped, and the name is
+  assigned to the side it was found on.
 
-## Upstream gap
+`ListCubebSinkDevices` also called `CoUninitialize()` before using cubeb, so the
+microphone list in the settings UI enumerated WASAPI devices and destroyed the
+cubeb context on a thread whose COM had already been torn down. COM now outlives
+`cubeb_destroy`.
 
-`nx2` forked from `upstream/nx2` at `a666e4400b` (2026-11-04). Upstream's tip is
-2026-11-08 (`0.1.0-rc3`) and carries Ocarina of Time work this branch does not,
-including:
+None of these three changes is compile-tested: this container has no cubeb
+headers and no configured build directory.
 
-- `c6d2acd37a` — "nx2: Ocarina of Time stability, shader and performance
-  fixes" (PR #794). Its crash list covers the VP9 movie race in the
-  dirty-memory gather, deleted buffer ids per channel, unmapped GPU writes and
-  address ranges, null addresses in compute reductions, render-target bounds,
-  a bounded query-result wait, and the `clip_distance_written` compile race.
-- `9a69d8eaf0`, `900ab5a825`, `de4ed9d9d7`, `031e07436c`, `a51a69fbfb` —
-  further Ocarina shader lowering and buffer binding.
+## Not the cause
 
-Per `AGENTS.md`, nx2 is merged with upstream before a new fix is written, and
-an existing upstream fix is ported rather than rewritten. Note that an unlowered
-instruction alone does not crash the host: shader exceptions are caught in
-`vk_pipeline_cache.cpp` and the program is rejected, which shows as a wrong
-image, not a termination.
+- An unlowered shader instruction. Shader exceptions are caught in
+  `vk_pipeline_cache.cpp` and the program is rejected, which shows as a wrong
+  image, not a stop.
+- The microphone release path. Upstream's fix (Eglantine `84e11a52ba`, eden PR
+  #3336) is already present in `src/audio_core/sink/sink_stream.cpp`.
+
+## Upstream gap, unrelated to this bug but outstanding
+
+`nx2` forked from `upstream/nx2` at `a666e4400b` (2026-11-04); upstream's tip is
+2026-11-08 (`0.1.0-rc3`) and carries Ocarina of Time work this branch lacks,
+including `c6d2acd37a` ("nx2: Ocarina of Time stability, shader and performance
+fixes", PR #794) and the later shader lowering in `9a69d8eaf0`, `900ab5a825`,
+`de4ed9d9d7`, `031e07436c` and `a51a69fbfb`. Upstream has no microphone or
+silent-capture fix, so there is nothing to port for this bug.

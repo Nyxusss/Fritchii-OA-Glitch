@@ -236,18 +236,28 @@ CubebSink::CubebSink(std::string_view target_device_name) {
     }
 
     if (target_device_name != auto_device_name && !target_device_name.empty()) {
-        cubeb_device_collection collection;
-        if (cubeb_enumerate_devices(ctx, CUBEB_DEVICE_TYPE_OUTPUT, &collection) != CUBEB_OK) {
-            LOG_WARNING(Audio_Sink, "Audio output device enumeration not supported");
-        } else {
+        // This class backs the input sink as well as the output sink, and only the device name
+        // reaches it, so the name is looked for among the capture devices too.
+        for (const auto type : {CUBEB_DEVICE_TYPE_OUTPUT, CUBEB_DEVICE_TYPE_INPUT}) {
+            cubeb_device_collection collection;
+            if (cubeb_enumerate_devices(ctx, type, &collection) != CUBEB_OK) {
+                LOG_WARNING(Audio_Sink, "Audio device enumeration not supported for type {}",
+                            static_cast<int>(type));
+                continue;
+            }
             const auto collection_end{collection.device + collection.count};
             const auto device{
                 std::find_if(collection.device, collection_end, [&](const cubeb_device_info& info) {
                     return info.friendly_name != nullptr &&
+                           info.state == CUBEB_DEVICE_STATE_ENABLED &&
                            target_device_name == std::string(info.friendly_name);
                 })};
             if (device != collection_end) {
-                output_device = device->devid;
+                if (type == CUBEB_DEVICE_TYPE_INPUT) {
+                    input_device = device->devid;
+                } else {
+                    output_device = device->devid;
+                }
             }
             cubeb_device_collection_destroy(ctx, &collection);
         }
@@ -278,8 +288,13 @@ CubebSink::~CubebSink() {
 SinkStream* CubebSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
                                          const std::string& name, StreamType type) {
     system_channels = system_channels_;
+    // device_channels comes from cubeb_get_max_channel_count, which reports the output device.
+    // Microphones are mono or stereo, so a six-channel request makes cubeb_stream_init reject the
+    // capture stream and the game reads silence. Open input streams with two channels, as the SDL
+    // sink already does.
+    const u32 stream_channels{type == StreamType::In ? 2U : device_channels};
     SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<CubebSinkStream>(
-        ctx, device_channels, system_channels, output_device, input_device, name, type, system));
+        ctx, stream_channels, system_channels, output_device, input_device, name, type, system));
     stream->SetDeviceVolume(device_volume);
 
     return stream.get();
@@ -326,14 +341,13 @@ std::vector<std::string> ListCubebSinkDevices(bool capture) {
 
     if (cubeb_init(&ctx, "Eden Device Enumerator", nullptr) != CUBEB_OK) {
         LOG_CRITICAL(Audio_Sink, "cubeb_init failed");
+#ifdef _WIN32
+        if (SUCCEEDED(com_init_result)) {
+            CoUninitialize();
+        }
+#endif
         return {};
     }
-
-#ifdef _WIN32
-    if (SUCCEEDED(com_init_result)) {
-        CoUninitialize();
-    }
-#endif
 
     auto type{capture ? CUBEB_DEVICE_TYPE_INPUT : CUBEB_DEVICE_TYPE_OUTPUT};
     cubeb_device_collection collection;
@@ -351,6 +365,13 @@ std::vector<std::string> ListCubebSinkDevices(bool capture) {
     }
 
     cubeb_destroy(ctx);
+
+#ifdef _WIN32
+    if (SUCCEEDED(com_init_result)) {
+        CoUninitialize();
+    }
+#endif
+
     return device_list;
 }
 
